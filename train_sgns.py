@@ -3,7 +3,7 @@ import re
 import random
 import time
 from pathlib import Path
-from collections import Counter
+from collections import Counter, OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -22,13 +22,16 @@ BATCH_SIZE = 512
 EPOCHS = 5
 LR = 0.05
 MIN_COUNT = 1
-SAVE_PATH = Path("updated_embeddings.csv")
+SAVE_PATH = Path("gen/embeddings_new.csv")   # updated output
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # chunking
 MAX_ROWS = 10_000
 CHUNK_ROWS = 5_000
 # DataLoader workers: 0 on Windows to avoid multiprocessing pickling problems
 DL_NUM_WORKERS = 0
+# special tokens & embedding file path
+SPECIAL_TOKENS = ["<PAD>", "<UNK>", "<START>", "<END>"]
+EMB_PATH = Path("gen/embeddings.csv")
 # -------------------------------------------------------------
 
 print("DEVICE ->", DEVICE)
@@ -97,12 +100,13 @@ class SGNSModel(nn.Module):
 
 # ---------- helpers ----------
 def save_embeddings(out_path: Path, idx2word, emb_numpy):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         header = ["word"] + [f"e{i}" for i in range(emb_numpy.shape[1])]
         writer.writerow(header)
         for i, w in idx2word.items():
-            row = [w] + emb_numpy[i].tolist()
+            row = [w] + emb_numpy[i].astype(float).tolist()
             writer.writerow(row)
 
 def build_vocab_counts_from_csv(csv_path: Path, max_rows=MAX_ROWS, chunk_rows=CHUNK_ROWS):
@@ -141,6 +145,20 @@ def generate_pairs_from_chunk_rows(chunk_df, word2idx, window_size=WINDOW_SIZE):
                 pairs.append((center_idx, word2idx[context]))
     return pairs
 
+def load_embeddings_csv(emb_path: Path):
+    """
+    Load embeddings.csv (word x e0..eN). Return:
+      - df: pandas DataFrame indexed by word (if file exists), otherwise None
+      - embed_dim: number of columns (int) or None
+    """
+    if not emb_path.exists():
+        return None, None
+    df = pd.read_csv(emb_path, index_col=0)
+    # strip index whitespace and convert to str
+    df.index = df.index.map(lambda x: str(x).strip())
+    embed_dim = df.shape[1]
+    return df, embed_dim
+
 # ---------- main ----------
 def main():
     global NEG_SAMPLER, EMBED_DIM
@@ -153,35 +171,86 @@ def main():
     counts, rows_loaded = build_vocab_counts_from_csv(news_path, max_rows=MAX_ROWS, chunk_rows=CHUNK_ROWS)
     print(f"Rows processed for vocab: {rows_loaded}, unique tokens seen: {len(counts)} (took {time.time()-t0:.1f}s)")
 
-    # build vocab
-    vocab = [w for w,c in counts.items() if c >= MIN_COUNT]
-    vocab.sort()
-    word2idx = {w:i for i,w in enumerate(vocab)}
-    idx2word = {i:w for w,i in word2idx.items()}
-    vocab_size = len(vocab)
-    print(f"Vocab size after min_count filter: {vocab_size}")
+    # Dataset vocab (apply MIN_COUNT)
+    dataset_vocab = sorted([w for w,c in counts.items() if c >= MIN_COUNT])
+    print(f"Dataset vocab size after min_count filter: {len(dataset_vocab)}")
 
-    # load initial embeddings if present
-    emb_path = Path("gen/embeddings.csv")
-    init_emb = None
-    if emb_path.exists():
-        print(f"Loading initial embeddings from {emb_path}")
-        df = pd.read_csv(emb_path, index_col=0)
-        EMBED_DIM = df.shape[1]
-        init_emb = np.random.normal(scale=0.01, size=(vocab_size, EMBED_DIM)).astype(np.float32)
+    # Load initial embeddings if present
+    emb_df, emb_dim = load_embeddings_csv(EMB_PATH)
+    if emb_df is not None:
+        print(f"Found embeddings file at {EMB_PATH} (embed_dim={emb_dim})")
+        EMBED_DIM = emb_dim
+        # preserve the order from CSV for words that appear in it
+        emb_words_ordered = list(emb_df.index)
+    else:
+        print("No embeddings CSV found at gen/embeddings.csv -> will random init for all words.")
+        emb_words_ordered = []
+
+    # Build final vocabulary:
+    # 1) ensure special tokens are present first (in given order) if they appear in embeddings OR dataset,
+    #    otherwise still include and init defaults for them.
+    # 2) then include words from embeddings.csv in file order (excluding already added special tokens)
+    # 3) then include remaining dataset words (excluding ones already added)
+    final_vocab = []
+    seen = set()
+
+    # always include special tokens (we will prefer their vector from emb_df if available)
+    for st in SPECIAL_TOKENS:
+        if st not in seen:
+            final_vocab.append(st)
+            seen.add(st)
+
+    # add embedding-file words (preserve order)
+    for w in emb_words_ordered:
+        if w not in seen:
+            final_vocab.append(w)
+            seen.add(w)
+
+    # add dataset words not yet present
+    for w in dataset_vocab:
+        if w not in seen:
+            final_vocab.append(w)
+            seen.add(w)
+
+    # final mapping
+    word2idx = {w:i for i,w in enumerate(final_vocab)}
+    idx2word = {i:w for w,i in word2idx.items()}
+    vocab_size = len(final_vocab)
+    print(f"Final vocab size (specials + emb-file + dataset-words): {vocab_size}")
+
+    # Prepare initial input embedding matrix of shape (vocab_size, EMBED_DIM)
+    rng = np.random.default_rng()
+    init_emb = np.empty((vocab_size, EMBED_DIM), dtype=np.float32)
+
+    if emb_df is not None:
+        # For words in emb_df with correct dimension, copy vector; else fall back to random or PAD=zero
         matched = 0
-        for w,i in word2idx.items():
-            if w in df.index:
-                vals = df.loc[w].values.astype(np.float32)
+        for i,w in idx2word.items():
+            if w in emb_df.index:
+                vals = emb_df.loc[w].values.astype(np.float32)
                 if vals.shape[0] == EMBED_DIM:
                     init_emb[i] = vals
                     matched += 1
-        print(f"Initialized embedding matrix (vocab x dim): {init_emb.shape}, matched words: {matched}")
+                else:
+                    # dimension mismatch -> random init
+                    init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
+            else:
+                # word not in embeddings.csv
+                if w == "<PAD>":
+                    init_emb[i] = np.zeros((EMBED_DIM,), dtype=np.float32)
+                else:
+                    init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
+        print(f"Initialized embedding matrix (vocab x dim): {init_emb.shape}, matched words from CSV: {matched}")
     else:
-        print("No initial embeddings file found. Random init.")
-        init_emb = np.random.uniform(low=-0.5/EMBED_DIM, high=0.5/EMBED_DIM, size=(vocab_size, EMBED_DIM)).astype(np.float32)
+        # fully random init
+        for i,w in idx2word.items():
+            if w == "<PAD>":
+                init_emb[i] = np.zeros((EMBED_DIM,), dtype=np.float32)
+            else:
+                init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
+        print(f"Randomly initialized embedding matrix (vocab x dim): {init_emb.shape}")
 
-    # negative sampler (global)
+    # negative sampler (global) -- counts for each final_vocab index
     counts_array = [counts.get(idx2word[i], 0) for i in range(vocab_size)]
     NEG_SAMPLER = NegativeSampler(counts_array)
 
@@ -189,7 +258,7 @@ def main():
     model = SGNSModel(vocab_size=vocab_size, embed_dim=EMBED_DIM, init_in_emb=init_emb).to(DEVICE)
     optimizer = optim.SGD(model.parameters(), lr=LR)
 
-    # training (streaming chunks)
+        # training (streaming chunks)
     print(f"Training: epochs={EPOCHS}, rows_per_chunk={CHUNK_ROWS}, max_rows={MAX_ROWS}")
     for epoch in range(1, EPOCHS + 1):
         print(f"=== Epoch {epoch}/{EPOCHS} ===")
@@ -199,7 +268,6 @@ def main():
         for chunk_df in chunk_iter:
             if rows_seen >= MAX_ROWS:
                 break
-            # clip last chunk to not exceed MAX_ROWS
             if rows_seen + len(chunk_df) > MAX_ROWS:
                 needed = MAX_ROWS - rows_seen
                 chunk_df = chunk_df.iloc[:needed]
@@ -234,12 +302,16 @@ def main():
                     tqdm.write(f"Epoch {epoch} chunk {chunk_index} batch {batch_idx} avg_loss {avg:.6f}")
                     running_loss = 0.0
 
-        print(f"Finished epoch {epoch}")
+        # === save embeddings at the end of each epoch ===
+        trained_in_emb = model.in_embed.weight.detach().cpu().numpy()
+        epoch_out = SAVE_PATH.with_name(f"embeddings_new_epoch{epoch}.csv")
+        save_embeddings(epoch_out, idx2word, trained_in_emb)
+        print(f"Saved embeddings after epoch {epoch} -> {epoch_out}")
 
-    # export trained input embeddings
+    # final save (last epoch) for consistency
     trained_in_emb = model.in_embed.weight.detach().cpu().numpy()
     save_embeddings(SAVE_PATH, idx2word, trained_in_emb)
-    print(f"Saved updated embeddings to {SAVE_PATH}")
+    print(f"Saved final updated embeddings to {SAVE_PATH}")
 
 if __name__ == "__main__":
     main()
