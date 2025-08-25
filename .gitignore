@@ -1,0 +1,4 @@
+data/allthenews/
+data/NewsContents.csv
+
+gen/embeddings.csv
