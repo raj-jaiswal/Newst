@@ -6,3 +6,4 @@ updated_embeddings.csv
 gen/updated_embeddings.csv
 
 *pycache__
+generator/checkpoints/*

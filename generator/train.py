@@ -34,15 +34,14 @@ if __name__ == '__main__':
     print(f'Vocab size: {vocab_size}, emb_dim: {emb_dim}')
 
     dataset = TitlesDataset(Path(args.news_csv), word2idx, max_len=args.max_len)
-    # Restrict to first 30k rows only
-    dataset = Subset(dataset, range(args.max_rows))
+    dataset = Subset(dataset, range(min(args.max_rows, len(dataset))))
 
     def collate_fn(batch):
         x = torch.stack(batch, dim=0)
         return x[:, :-1], x[:, 1:]
 
-    model = RNNGenerator(vocab_size=vocab_size, emb_dim=emb_dim, emb_matrix=emb_matrix,
-                         num_layers=args.num_layers).to(device)
+    model = RNNGenerator(vocab_size=vocab_size, emb_dim=emb_dim,
+                         emb_matrix=emb_matrix, num_layers=args.num_layers).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=word2idx['<PAD>'])
@@ -50,10 +49,23 @@ if __name__ == '__main__':
     ckpt_dir = Path('generator/checkpoints')
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # === Resume from latest checkpoint if exists ===
+    start_epoch = 1
+    latest_ckpt = None
+    ckpts = sorted(ckpt_dir.glob("checkpoint_epoch*.pt"))
+    if ckpts:
+        latest_ckpt = ckpts[-1]
+        print(f"Resuming from {latest_ckpt}")
+        checkpoint = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(checkpoint['model_state'])
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from epoch {checkpoint['epoch']}")
+
     CHUNK_SIZE = 5000
     num_chunks = len(dataset) // CHUNK_SIZE
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -63,13 +75,15 @@ if __name__ == '__main__':
             start = chunk_idx * CHUNK_SIZE
             end = start + CHUNK_SIZE
             chunk = Subset(dataset, range(start, end))
-            dl = DataLoader(chunk, batch_size=args.batch, shuffle=True, collate_fn=collate_fn)
+            dl = DataLoader(chunk, batch_size=args.batch,
+                            shuffle=True, collate_fn=collate_fn)
 
-            loop = tqdm(dl, desc=f"Epoch {epoch}/{args.epochs} [chunk {chunk_idx+1}/{num_chunks}]", unit="batch", leave=True)
+            loop = tqdm(dl, desc=f"Epoch {epoch}/{args.epochs} [chunk {chunk_idx+1}/{num_chunks}]",
+                        unit="batch", leave=True)
             for i, (inp, target) in enumerate(loop, start=1):
                 inp, target = inp.to(device), target.to(device)
                 optimizer.zero_grad()
-                logits = model(inp)  # (batch, seq_len, vocab)
+                logits = model(inp)
                 loss = criterion(logits.reshape(-1, vocab_size), target.reshape(-1))
                 loss.backward()
                 optimizer.step()
@@ -77,13 +91,12 @@ if __name__ == '__main__':
                 running_loss += loss.item()
                 seen_batches += 1
                 avg_loss = running_loss / seen_batches
-
                 loop.set_postfix({'loss': f"{loss.item():.4f}", 'avg_loss': f"{avg_loss:.4f}"})
 
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch} finished — avg_loss {avg_loss:.6f} — time {epoch_time:.1f}s")
 
-        # save checkpoint
+        # Save checkpoint
         ckpt = {
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
