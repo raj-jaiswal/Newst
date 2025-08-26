@@ -24,19 +24,21 @@ LR = 0.05
 MIN_COUNT = 1
 SAVE_PATH = Path("gen/embeddings_new.csv")   # updated output
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 # chunking
-MAX_ROWS = 10_000
+MAX_ROWS = 30_000
 CHUNK_ROWS = 5_000
+
 # DataLoader workers: 0 on Windows to avoid multiprocessing pickling problems
 DL_NUM_WORKERS = 0
+
 # special tokens & embedding file path
 SPECIAL_TOKENS = ["<PAD>", "<UNK>", "<START>", "<END>"]
 EMB_PATH = Path("gen/embeddings.csv")
 # -------------------------------------------------------------
 
-print("DEVICE ->", DEVICE)
+print("DEVICE:", DEVICE)
 
-# ---------- tokenization ----------
 def tokenize(text: str):
     text = (text or "").lower()
     text = text.replace("—", " ").replace("’", "'").replace("“", '"').replace("”", '"')
@@ -50,7 +52,6 @@ def tokenize_row_text(row):
         content += str(row["title"])
     return tokenize(content)
 
-# ---------- dataset ----------
 class SGNSDataset(Dataset):
     def __init__(self, pairs):
         self.pairs = pairs
@@ -59,7 +60,6 @@ class SGNSDataset(Dataset):
     def __getitem__(self, idx):
         return self.pairs[idx]
 
-# We'll use a top-level collate that uses NEG_SAMPLER (set in main)
 NEG_SAMPLER = None  # set in main()
 
 def collate_fn_top(batch):
@@ -69,15 +69,17 @@ def collate_fn_top(batch):
     negs = torch.tensor(negs, dtype=torch.long)
     return centers, contexts, negs
 
-# ---------- negative sampler ----------
 class NegativeSampler:
     def __init__(self, counts_array):
         pow_counts = np.array(counts_array, dtype=np.float64) ** 0.75
-        self.probs = (pow_counts / pow_counts.sum()).astype(np.float64)
+        # handle all-zero case
+        if pow_counts.sum() == 0:
+            self.probs = np.ones_like(pow_counts, dtype=np.float64) / len(pow_counts)
+        else:
+            self.probs = (pow_counts / pow_counts.sum()).astype(np.float64)
     def __call__(self, batch_size, neg_k):
         return np.random.choice(len(self.probs), size=(batch_size, neg_k), p=self.probs)
 
-# ---------- model ----------
 class SGNSModel(nn.Module):
     def __init__(self, vocab_size, embed_dim, init_in_emb=None):
         super().__init__()
@@ -98,7 +100,6 @@ class SGNSModel(nn.Module):
         loss = - (pos_loss + neg_loss).mean()
         return loss
 
-# ---------- helpers ----------
 def save_embeddings(out_path: Path, idx2word, emb_numpy):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
@@ -126,23 +127,42 @@ def build_vocab_counts_from_csv(csv_path: Path, max_rows=MAX_ROWS, chunk_rows=CH
 
 def generate_pairs_from_chunk_rows(chunk_df, word2idx, window_size=WINDOW_SIZE):
     pairs = []
-    for _, row in chunk_df.iterrows():
-        toks = tokenize_row_text(row)
-        L = len(toks)
-        for i, center in enumerate(toks):
-            if center not in word2idx:
-                continue
-            center_idx = word2idx[center]
-            cur_win = random.randint(1, window_size)
-            start = max(0, i - cur_win)
-            end = min(L, i + cur_win + 1)
-            for j in range(start, end):
-                if j == i:
+    unk_idx = word2idx.get('<UNK>')
+    if unk_idx is None:
+        # If <UNK> isn't present, skip unknown words (safer fallback)
+        for _, row in chunk_df.iterrows():
+            toks = tokenize_row_text(row)
+            L = len(toks)
+            for i, center in enumerate(toks):
+                if center not in word2idx:
                     continue
-                context = toks[j]
-                if context not in word2idx:
-                    continue
-                pairs.append((center_idx, word2idx[context]))
+                center_idx = word2idx[center]
+                cur_win = random.randint(1, window_size)
+                start = max(0, i - cur_win)
+                end = min(L, i + cur_win + 1)
+                for j in range(start, end):
+                    if j == i:
+                        continue
+                    context = toks[j]
+                    if context not in word2idx:
+                        continue
+                    pairs.append((center_idx, word2idx[context]))
+    else:
+        # Map unknown tokens to <UNK> so we train its vector
+        for _, row in chunk_df.iterrows():
+            toks = tokenize_row_text(row)
+            L = len(toks)
+            for i, center in enumerate(toks):
+                center_idx = word2idx.get(center, unk_idx)
+                cur_win = random.randint(1, window_size)
+                start = max(0, i - cur_win)
+                end = min(L, i + cur_win + 1)
+                for j in range(start, end):
+                    if j == i:
+                        continue
+                    context = toks[j]
+                    context_idx = word2idx.get(context, unk_idx)
+                    pairs.append((center_idx, context_idx))
     return pairs
 
 def load_embeddings_csv(emb_path: Path):
@@ -159,7 +179,6 @@ def load_embeddings_csv(emb_path: Path):
     embed_dim = df.shape[1]
     return df, embed_dim
 
-# ---------- main ----------
 def main():
     global NEG_SAMPLER, EMBED_DIM
 
@@ -171,9 +190,9 @@ def main():
     counts, rows_loaded = build_vocab_counts_from_csv(news_path, max_rows=MAX_ROWS, chunk_rows=CHUNK_ROWS)
     print(f"Rows processed for vocab: {rows_loaded}, unique tokens seen: {len(counts)} (took {time.time()-t0:.1f}s)")
 
-    # Dataset vocab (apply MIN_COUNT)
+    # Dataset vocab (apply MIN_COUNT) -- only used to compute unk-count; we WILL NOT add these words to final vocab
     dataset_vocab = sorted([w for w,c in counts.items() if c >= MIN_COUNT])
-    print(f"Dataset vocab size after min_count filter: {len(dataset_vocab)}")
+    print(f"Dataset unique tokens (after min_count filter): {len(dataset_vocab)} -- these will be collapsed to <UNK> if not present in embeddings.csv")
 
     # Load initial embeddings if present
     emb_df, emb_dim = load_embeddings_csv(EMB_PATH)
@@ -183,18 +202,14 @@ def main():
         # preserve the order from CSV for words that appear in it
         emb_words_ordered = list(emb_df.index)
     else:
-        print("No embeddings CSV found at gen/embeddings.csv -> will random init for all words.")
+        print("No embeddings CSV found at gen/embeddings.csv - will random init for all words.")
         emb_words_ordered = []
 
     # Build final vocabulary:
-    # 1) ensure special tokens are present first (in given order) if they appear in embeddings OR dataset,
-    #    otherwise still include and init defaults for them.
-    # 2) then include words from embeddings.csv in file order (excluding already added special tokens)
-    # 3) then include remaining dataset words (excluding ones already added)
+    # We will *only* use words present in embeddings.csv (plus special tokens placed first).
     final_vocab = []
     seen = set()
 
-    # always include special tokens (we will prefer their vector from emb_df if available)
     for st in SPECIAL_TOKENS:
         if st not in seen:
             final_vocab.append(st)
@@ -206,24 +221,21 @@ def main():
             final_vocab.append(w)
             seen.add(w)
 
-    # add dataset words not yet present
-    for w in dataset_vocab:
-        if w not in seen:
-            final_vocab.append(w)
-            seen.add(w)
+    if "<UNK>" not in seen:
+        final_vocab.insert(1, "<UNK>")  # after <PAD>
+        seen.add("<UNK>")
 
     # final mapping
     word2idx = {w:i for i,w in enumerate(final_vocab)}
     idx2word = {i:w for w,i in word2idx.items()}
     vocab_size = len(final_vocab)
-    print(f"Final vocab size (specials + emb-file + dataset-words): {vocab_size}")
+    print(f"Final vocab size (specials + emb-file-words only): {vocab_size}")
 
     # Prepare initial input embedding matrix of shape (vocab_size, EMBED_DIM)
     rng = np.random.default_rng()
     init_emb = np.empty((vocab_size, EMBED_DIM), dtype=np.float32)
 
     if emb_df is not None:
-        # For words in emb_df with correct dimension, copy vector; else fall back to random or PAD=zero
         matched = 0
         for i,w in idx2word.items():
             if w in emb_df.index:
@@ -232,7 +244,7 @@ def main():
                     init_emb[i] = vals
                     matched += 1
                 else:
-                    # dimension mismatch -> random init
+                    # dimension mismatch: random init
                     init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
             else:
                 # word not in embeddings.csv
@@ -242,7 +254,6 @@ def main():
                     init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
         print(f"Initialized embedding matrix (vocab x dim): {init_emb.shape}, matched words from CSV: {matched}")
     else:
-        # fully random init
         for i,w in idx2word.items():
             if w == "<PAD>":
                 init_emb[i] = np.zeros((EMBED_DIM,), dtype=np.float32)
@@ -250,15 +261,27 @@ def main():
                 init_emb[i] = rng.normal(0.0, 0.01, size=(EMBED_DIM,)).astype(np.float32)
         print(f"Randomly initialized embedding matrix (vocab x dim): {init_emb.shape}")
 
-    # negative sampler (global) -- counts for each final_vocab index
-    counts_array = [counts.get(idx2word[i], 0) for i in range(vocab_size)]
+
+    set_final = set(final_vocab)
+    unk_count = sum(c for w,c in counts.items() if w not in set_final)
+    # also include any counts for a literal '<UNK>' token in the data
+    unk_count += counts.get('<UNK>', 0)
+
+    counts_array = []
+    for i in range(vocab_size):
+        w = idx2word[i]
+        if w == '<UNK>':
+            counts_array.append(int(unk_count))
+        else:
+            counts_array.append(int(counts.get(w, 0)))
+
     NEG_SAMPLER = NegativeSampler(counts_array)
 
     # model & optimizer
     model = SGNSModel(vocab_size=vocab_size, embed_dim=EMBED_DIM, init_in_emb=init_emb).to(DEVICE)
     optimizer = optim.SGD(model.parameters(), lr=LR)
 
-        # training (streaming chunks)
+    # training (streaming chunks)
     print(f"Training: epochs={EPOCHS}, rows_per_chunk={CHUNK_ROWS}, max_rows={MAX_ROWS}")
     for epoch in range(1, EPOCHS + 1):
         print(f"=== Epoch {epoch}/{EPOCHS} ===")
@@ -302,7 +325,7 @@ def main():
                     tqdm.write(f"Epoch {epoch} chunk {chunk_index} batch {batch_idx} avg_loss {avg:.6f}")
                     running_loss = 0.0
 
-        # === save embeddings at the end of each epoch ===
+        # save embeddings at the end of each epoch
         trained_in_emb = model.in_embed.weight.detach().cpu().numpy()
         epoch_out = SAVE_PATH.with_name(f"embeddings_new_epoch{epoch}.csv")
         save_embeddings(epoch_out, idx2word, trained_in_emb)
