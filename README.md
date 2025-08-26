@@ -6,6 +6,13 @@ Data Source: \
 https://www.kaggle.com/datasets/bestwater/wikitext-2-v1?resource=download  
 https://www.kaggle.com/datasets/cymerunaslam/allthenews/data
 
+#### Fake News Generated
+* why donald j is publicly the most thing to buy
+* this may be doing a anti price on new people in america
+* obama campaign reveals a human electoral opportunity
+* one of the most popular view of the us is north korean
+* why the bank breaks doors from dubai after scoring territory
+
 ---
 
 ## Project overview
