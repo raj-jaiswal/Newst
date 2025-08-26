@@ -3,7 +3,7 @@
 This README documents everything we've done so far to prepare a small vocabulary, initialize random embeddings, download the `allthenews` dataset, and produce a single cleaned CSV of **title** + **content** ready for model training.
 
 Data Source: \
-https://www.kaggle.com/datasets/bestwater/wikitext-2-v1?resource=download
+https://www.kaggle.com/datasets/bestwater/wikitext-2-v1?resource=download  
 https://www.kaggle.com/datasets/cymerunaslam/allthenews/data
 
 ---
@@ -21,7 +21,7 @@ What we have produced:
 
 ---
 
-## Files / Scripts (suggested names)
+## Files for Embedding Training
 
 Below are the scripts that were used / recommended. Save each as a `.py` file and run them in order.
 
@@ -103,3 +103,35 @@ python -c "from kaggle.api.kaggle_api_extended import KaggleApi; api=KaggleApi()
 * Experiment with embedding dimensions (100 vs 200) and measure validation perplexity on held-out headlines.
 
 ---
+
+## Model Training
+
+We implemented a simple RNN/LSTM-based generator with embeddings initialized from `embeddings_init.csv`.
+
+**Training command (example):**
+
+```bash
+python -m generator.train --emb_csv gen/embeddings_new.csv --news_csv data/NewsContents.csv --epochs 5 --batch 64 --device cuda --max_rows 30000
+```
+
+Checkpoints are automatically saved under `generator/checkpoints/` as `checkpoint_epochX.pt`.
+
+Progress bars (`tqdm`) show training progress with loss updates per batch.
+
+---
+
+## Text Generation
+
+Once a checkpoint is trained, you can generate fake news titles using:
+
+```bash
+python -m generator.generate   --ckpt generator/checkpoints/checkpoint_epoch5.pt   --device cuda   --mode sample   --max_len 50   --temperature 1.0
+```
+
+Options:
+
+* `--mode greedy` → always picks the highest-probability token (argmax).
+* `--mode sample` → samples probabilistically (avoids `<UNK>` tokens).
+* `--temperature` → controls randomness. Higher values (e.g., 1.5) make text more diverse; lower values (e.g., 0.7) make it more conservative.
+
+Generation stops automatically when `<END>` token is produced, and strips `<START>`, `<END>`, and `<PAD>` tokens from the final output.

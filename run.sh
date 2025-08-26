@@ -1,2 +1,2 @@
 python -m generator.train --emb_csv gen/embeddings_new.csv --news_csv data/NewsContents.csv --epochs 5 --batch 64 --device cpu --max_rows 30000
-python -m generator.generate --ckpt generator/checkpoints/checkpoint_epoch5.pt --device cpu --max_len 50
+python -m generator.generate --ckpt generator/checkpoints/checkpoint_epoch5.pt --mode sample
