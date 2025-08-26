@@ -1,9 +1,10 @@
-
 # --- generator/generate.py ---
 """
-Generation script. Keeps generating until it finds <END>. If an <UNK> is produced at any step,
-it restarts generation (as you requested). It prints the softmax vector `y` at each timestep.
+Generation script. Keeps generating until it finds <END>.
+If <UNK> is produced, it is skipped (never selected).
+Prints the softmax vector `y` at each timestep.
 """
+
 if __name__ == '__main__':
     import argparse
     import torch
@@ -17,6 +18,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_len', type=int, default=50)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--mode', type=str, default='sample', choices=['greedy', 'sample'],
+                        help="Choose 'greedy' (argmax) or 'sample' (probabilistic sampling).")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -27,7 +30,7 @@ if __name__ == '__main__':
 
     ckpt = torch.load(ckpt_path, map_location=device)
     word2idx = ckpt['word2idx']
-    idx2word = {i:w for w,i in word2idx.items()}
+    idx2word = {i: w for w, i in word2idx.items()}
     vocab_size = ckpt['vocab_size']
     emb_dim = ckpt['emb_dim']
 
@@ -43,50 +46,45 @@ if __name__ == '__main__':
     end_idx = word2idx['<END>']
     unk_idx = word2idx['<UNK>']
 
-    max_attempts = 100
-    attempt = 0
+    seq = [start_idx]
+    hidden = None
     generated = None
 
-    while attempt < max_attempts:
-        attempt += 1
-        seq = [start_idx]
-        hidden = None
-        ok = True
-        print(f'Generation attempt {attempt}...')
-        for t in range(args.max_len):
-            x = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)  # (1, seq_len)
-            with torch.no_grad():
-                logits = model(x)  # (1, seq_len, vocab)
-                last_logits = logits[0, -1, :]  # (vocab,)
-                # apply temperature
-                probs = torch.softmax(last_logits / max(1e-8, args.temperature), dim=0)
-                y = probs.cpu().numpy()
+    print('Starting generation...')
+    for t in range(args.max_len):
+        x = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)  # (1, seq_len)
+        with torch.no_grad():
+            logits = model(x)  # (1, seq_len, vocab)
+            last_logits = logits[0, -1, :]  # (vocab,)
+            # apply temperature
+            probs = torch.softmax(last_logits / max(1e-8, args.temperature), dim=0)
+            y = probs.cpu().numpy()
 
-            # print the full y vector
-            np.set_printoptions(precision=4, suppress=True)
-            print('y =', y)
+        # print the full y vector
+        np.set_printoptions(precision=4, suppress=True)
+        print('y =', y)
 
-            # choose next token via argmax (greedy). If you prefer sampling, replace with torch.multinomial
-            next_idx = int(torch.argmax(probs).item())
-            print('chosen ->', idx2word.get(next_idx, '<UNK>'))
+        if args.mode == 'greedy':
+            next_idx = int(np.argmax(y))
+        else:  # sampling mode
+            y[unk_idx] = 0.0  # mask <UNK>
+            if y.sum() == 0:
+                next_idx = np.random.randint(0, vocab_size)  # fallback
+            else:
+                y = y / y.sum()
+                next_idx = int(np.random.choice(len(y), p=y))
 
-            if next_idx == unk_idx:
-                print('Generated <UNK> — restarting generation (per rules).')
-                ok = False
-                break
-            seq.append(next_idx)
-            if next_idx == end_idx:
-                # success
-                generated = [idx2word.get(i, '<UNK>') for i in seq]
-                break
+        print('chosen ->', idx2word.get(next_idx, '<UNK>'))
 
-        if ok and generated is not None:
-            # strip start/end
-            tokens = [w for w in generated if w not in ('<START>', '<END>', '<PAD>')]
-            print('FINAL GENERATED TITLE:', ' '.join(tokens))
+        if next_idx == end_idx:
+            generated = [idx2word.get(i, '<UNK>') for i in seq + [end_idx]]
             break
-        else:
-            print('Attempt failed; trying again...')
 
-    if generated is None:
-        print('Failed to generate a title without <UNK> in', max_attempts, 'attempts.')
+        seq.append(next_idx)
+
+    if generated is not None:
+        # strip start/end/pad
+        tokens = [w for w in generated if w not in ('<START>', '<END>', '<PAD>')]
+        print('FINAL GENERATED TITLE:', ' '.join(tokens))
+    else:
+        print('Generation ended without finding <END>.')
